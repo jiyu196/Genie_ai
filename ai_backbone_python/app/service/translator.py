@@ -27,9 +27,21 @@ def translate_to_korean(text: str) -> str:
         data = res.json()
 
         # JS의 data?.[0]?.[0]?.[0] 대응
-        if isinstance(data, list):
-            return data[0][0][0] if data and data[0] and data[0][0] else text
+        # if isinstance(data, list) and data and isinstance(data[0], list):
+        #     translated = "".join(
+        #         segment[0] for segment in data[0]
+        #         if isinstance(segment, list) and segment and segment[0]
+        #     )
+        #     return translated.strip() if translated else text
+        if isinstance(data, list) and data and isinstance(data[0], list):
+            # 🔑 핵심: 첫 문장 제외
+            translated = "".join(
+                segment[0]
+                for segment in data[0][1:]
+                if isinstance(segment, list) and segment and segment[0]
+            )
 
+            return translated.strip() if translated else ""
         return text
 
     except Exception as e:

@@ -132,12 +132,27 @@ def generate_image(
             # Revised prompt 추출
             if image_url:
                 try:
-                    refined_content = resp.data[0].revised_prompt
+                    item0 = resp.data[0]
+                    logger.info("[DALL·E] data[0] type=%s", type(item0))
+                    logger.info("[DALL·E] data[0] has revised_prompt=%s",
+                                hasattr(item0, "revised_prompt") if not isinstance(item0, dict) else (
+                                            "revised_prompt" in item0))
+
+                    # 객체 / dict 모두 대응
+                    if isinstance(item0, dict):
+                        refined_content = item0.get("revised_prompt")
+                    else:
+                        refined_content = getattr(item0, "revised_prompt", None)
+
                     if refined_content:
                         logger.info("[DALL·E] Revised prompt extracted | length=%d", len(refined_content))
+                    else:
+                        logger.warning("[DALL·E] revised_prompt is missing/empty | data0_type=%s", type(item0))
+
                 except (AttributeError, IndexError, TypeError) as e:
                     logger.debug("[DALL·E] No revised_prompt in response | error=%s", str(e))
                     refined_content = None
+
 
         except Exception as e:
             msg = f"Failed to parse OpenAI response: {str(e)}"
@@ -173,7 +188,7 @@ def generate_image(
     except BadRequestError as e:
         msg = str(e)
 
-        # 🔴 OpenAI 정책 차단 (의도된 실패)
+        #####>>  OpenAI 정책 차단 (의도된 실패)
         if "content_policy_violation" in msg:
             logger.warning("[DALL·E] blocked by content policy | prompt=%s", prompt[:200])
             return {
