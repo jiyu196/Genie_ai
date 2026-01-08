@@ -5,17 +5,22 @@ import logging
 from typing import Any, Dict
 
 logger = logging.getLogger("openai_image_service")
-client = OpenAI(api_key=OPENAI_API_KEY)
+
+# =========================
+# OpenAI 클라이언트 초기화
+# =========================
+client = None
 
 try:
     if not OPENAI_API_KEY or not OPENAI_API_KEY.strip():
-        logger.critical("[DALL·E] OpenAI API Key is missing or empty")
-        raise ValueError("OpenAI API Key is not configured")
+        logger.critical("[INIT] OpenAI API Key 누락 또는 비어있음")
+        raise ValueError("OpenAI API Key가 설정되지 않았습니다")
 
     client = OpenAI(api_key=OPENAI_API_KEY)
-    logger.info("[DALL·E] OpenAI client initialized successfully")
+    logger.info("[INIT] OpenAI 클라이언트 초기화 성공")
+
 except Exception as e:
-    logger.critical("[DALL·E] Failed to initialize OpenAI client | error=%s", str(e))
+    logger.critical("[INIT] OpenAI 클라이언트 초기화 실패 | error=%s", str(e))
     client = None
 
 
@@ -27,62 +32,70 @@ def generate_image(
         style: str = "vivid",
 ) -> Dict[str, Any]:
     """
-    ✅ 절대 예외를 밖으로 던지지 않음 (서버가 죽지 않게)
-    ✅ 실패 시: image_url=None, refined_content=None, error_message=str(...)
-    ✅ 성공 시: image_url=..., refined_content(있으면), error_message=None
+    DALL-E 이미지 생성 함수
+
+    ✅ 절대 예외를 밖으로 던지지 않음 (서버 안정성 보장)
+    ✅ 실패 시: image_url=None, refined_content=None, error_message=str
+    ✅ 성공 시: image_url=str, refined_content=str/None, error_message=None
+
     Args:
-        models: DALL-E 모델명
+        models: DALL-E 모델명 (기본값: dall-e-3)
         prompt: 이미지 생성 프롬프트
-        size: 이미지 크기
-        quality: 이미지 품질
-        style: 이미지 스타일
+        size: 이미지 크기 (기본값: 1024x1024)
+        quality: 이미지 품질 (기본값: standard)
+        style: 이미지 스타일 (기본값: vivid)
 
     Returns:
-        Dict with keys: image_url, refined_content, error_message
+        Dict[str, Any]: {
+            "image_url": str | None,
+            "refined_content": str | None,  # OpenAI의 revised_prompt
+            "error_message": str | None
+        }
     """
 
     logger.info(
-        "[DALL·E] Generate image request | model=%s, size=%s, quality=%s, style=%s, promptLen=%d",
+        "[REQUEST] 이미지 생성 요청 | model=%s | size=%s | quality=%s | style=%s | prompt_len=%d",
         models, size, quality, style, len(prompt) if prompt else 0
     )
-    # -----------------------------
+
+    # =========================
     # 1. 클라이언트 초기화 확인
-    # -----------------------------
+    # =========================
     if client is None:
-        msg = "OpenAI client is not initialized"
-        logger.error("[DALL·E] %s", msg)
+        error_msg = "OpenAI 클라이언트가 초기화되지 않았습니다"
+        logger.error("[VALIDATION] %s", error_msg)
         return {
             "image_url": None,
             "refined_content": None,
-            "error_message": msg,
+            "error_message": error_msg,
         }
-    # -----------------------------
+
+    # =========================
     # 2. 입력 검증
-    # -----------------------------
+    # =========================
     if not prompt or not prompt.strip():
-        #msg = "prompt is empty"
-        msg = "서버 문제로 이미지를 생성하지 못합니다."
-        logger.warning("[DALL·E] invalid request: %s", msg)
+        error_msg = "프롬프트가 비어있습니다"
+        logger.warning("[VALIDATION] %s", error_msg)
         return {
             "image_url": None,
             "refined_content": None,
-            "error_message": msg,
+            "error_message": error_msg,
         }
+
     if not models or not models.strip():
-        #msg = "model name is empty"
-        msg = "서버 문제로 이미지를 생성하지 못합니다."
-        logger.warning("[DALL·E] Invalid request: %s", msg)
+        error_msg = "모델명이 비어있습니다"
+        logger.warning("[VALIDATION] %s", error_msg)
         return {
             "image_url": None,
             "refined_content": None,
-            "error_message": msg,
+            "error_message": error_msg,
         }
 
     try:
-        # -----------------------------
+        # =========================
         # 3. OpenAI API 호출
-        # -----------------------------
-        logger.debug("[DALL·E] Calling OpenAI API | prompt=%s", prompt[:200])
+        # =========================
+        logger.info("[API_CALL] DALL-E API 호출 시작 | prompt=%s...", prompt[:100])
 
         resp = client.images.generate(
             model=models,
@@ -92,169 +105,175 @@ def generate_image(
             style=style,
             n=1,
         )
-        logger.debug("[DALL·E] OpenAI API call successful")
 
-        # -----------------------------
-        # 4. OpenAI 응답 파싱(URL 추출)
-        # -----------------------------
-        image_url = None
-        refined_content = None
+        logger.info("[API_CALL] DALL-E API 호출 성공")
+
+        # =========================
+        # 4. 응답 구조 검증
+        # =========================
+        if not resp:
+            error_msg = "OpenAI 응답이 비어있습니다"
+            logger.error("[PARSE] %s", error_msg)
+            return {
+                "image_url": None,
+                "refined_content": None,
+                "error_message": error_msg,
+            }
+
+        if not hasattr(resp, 'data'):
+            error_msg = "OpenAI 응답 구조가 잘못되었습니다 (data 속성 없음)"
+            logger.error("[PARSE] %s | resp_type=%s", error_msg, type(resp).__name__)
+            return {
+                "image_url": None,
+                "refined_content": None,
+                "error_message": error_msg,
+            }
+
+        if not resp.data or len(resp.data) == 0:
+            error_msg = "OpenAI 응답 데이터가 비어있습니다"
+            logger.error("[PARSE] %s", error_msg)
+            return {
+                "image_url": None,
+                "refined_content": None,
+                "error_message": error_msg,
+            }
+
+        # =========================
+        # 5. 이미지 URL 추출
+        # =========================
         try:
-            # 응답 구조 검증
-            if not resp or not hasattr(resp, 'data'):
-                msg = "Invalid OpenAI response structure (no data)"
-                logger.error("[DALL·E] %s | resp=%s", msg, resp)
+            image_url = resp.data[0].url
+
+            if not image_url or not image_url.strip():
+                error_msg = "이미지 URL이 비어있습니다"
+                logger.error("[PARSE] %s", error_msg)
                 return {
                     "image_url": None,
                     "refined_content": None,
-                    "error_message": msg,
+                    "error_message": error_msg,
                 }
 
-            if not resp.data or len(resp.data) == 0:
-                msg = "OpenAI response data is empty"
-                logger.error("[DALL·E] %s", msg)
-                return {
-                    "image_url": None,
-                    "refined_content": None,
-                    "error_message": msg,
-                }
+            logger.info("[PARSE] 이미지 URL 추출 성공 | url=%s...", image_url[:60])
 
-            # 이미지 URL 추출
-            try:
-                image_url = resp.data[0].url
-                if not image_url or not image_url.strip():
-                    logger.warning("[DALL·E] Image URL is empty in response")
-                    image_url = None
-            except (AttributeError, IndexError, TypeError) as e:
-                logger.error("[DALL·E] Failed to extract image URL | error=%s", str(e))
-                image_url = None
+        except (AttributeError, IndexError, TypeError) as e:
+            error_msg = f"이미지 URL 추출 실패: {str(e)}"
+            logger.error("[PARSE] %s", error_msg)
+            return {
+                "image_url": None,
+                "refined_content": None,
+                "error_message": error_msg,
+            }
 
-            # Revised prompt 추출
-            if image_url:
-                try:
-                    item0 = resp.data[0]
-                    logger.info("[DALL·E] data[0] type=%s", type(item0))
-                    logger.info("[DALL·E] data[0] has revised_prompt=%s",
-                                hasattr(item0, "revised_prompt") if not isinstance(item0, dict) else (
-                                            "revised_prompt" in item0))
+        # =========================
+        # 6. Revised Prompt 추출 (선택적)
+        # =========================
+        refined_content = None
 
-                    # 객체 / dict 모두 대응
-                    if isinstance(item0, dict):
-                        refined_content = item0.get("revised_prompt")
-                    else:
-                        refined_content = getattr(item0, "revised_prompt", None)
+        try:
+            item = resp.data[0]
 
-                    if refined_content:
-                        logger.info("[DALL·E] Revised prompt extracted | length=%d", len(refined_content))
-                    else:
-                        logger.warning("[DALL·E] revised_prompt is missing/empty | data0_type=%s", type(item0))
+            # dict 또는 객체 모두 대응
+            if isinstance(item, dict):
+                refined_content = item.get("revised_prompt")
+            else:
+                refined_content = getattr(item, "revised_prompt", None)
 
-                except (AttributeError, IndexError, TypeError) as e:
-                    logger.debug("[DALL·E] No revised_prompt in response | error=%s", str(e))
-                    refined_content = None
-
+            if refined_content and refined_content.strip():
+                logger.info("[PARSE] Revised prompt 추출 성공 | length=%d", len(refined_content))
+            else:
+                logger.debug("[PARSE] Revised prompt 없음 또는 비어있음")
+                refined_content = None
 
         except Exception as e:
-            msg = f"Failed to parse OpenAI response: {str(e)}"
-            logger.exception("[DALL·E] %s", msg)
-            return {
-                "image_url": None,
-                "refined_content": None,
-                "error_message": msg,
-            }
+            logger.debug("[PARSE] Revised prompt 추출 실패 (무시 가능) | error=%s", str(e))
+            refined_content = None
 
-        # -----------------------------
-        # 5. 이미지 URL 검증
-        # -----------------------------
-        if image_url is None:
-            msg = "OpenAI response has no image url"
-            logger.error("[DALL·E] %s", msg)
-            return {
-                "image_url": None,
-                "refined_content": None,
-                "error_message": msg,
-            }
-
-        # -----------------------------
-        # 6. 성공 응답
-        # -----------------------------
-        logger.info("[DALL·E] Image generated successfully | url=%s", image_url[:100])
+        # =========================
+        # 7. 성공 응답 반환
+        # =========================
+        logger.info("[SUCCESS] 이미지 생성 완료 | url=%s...", image_url[:60])
         return {
             "image_url": image_url,
             "refined_content": refined_content,
             "error_message": None,
         }
 
+    # =========================
+    # 8. OpenAI 예외 처리
+    # =========================
     except BadRequestError as e:
-        msg = str(e)
+        error_detail = str(e)
 
-        #####>>  OpenAI 정책 차단 (의도된 실패)
-        if "content_policy_violation" in msg:
-            logger.warning("[DALL·E] blocked by content policy | prompt=%s", prompt[:200])
+        # 콘텐츠 정책 위반 (의도된 실패)
+        if "content_policy_violation" in error_detail.lower():
+            logger.warning(
+                "[POLICY] 콘텐츠 정책 위반 | prompt=%s...",
+                prompt[:100]
+            )
             return {
                 "image_url": None,
                 "refined_content": None,
-                "error_message": "content_policy_violation",
+                "error_message": "콘텐츠  정책에 위반되어 이미지를 만들지 않습니다.",
             }
 
-        # 기타 BadRequest 에러
+        # 기타 잘못된 요청
         logger.error(
-            "[DALL·E] BadRequestError | model=%s, size=%s, quality=%s, style=%s, prompt=%s, error=%s",
-            models, size, quality, style, prompt[:200], msg
+            "[ERROR] BadRequest 오류 | model=%s | size=%s | quality=%s | style=%s | error=%s",
+            models, size, quality, style, error_detail
         )
         return {
             "image_url": None,
             "refined_content": None,
-            "error_message": f"Bad request: {msg}",
+            "error_message": f"잘못된 요청: {error_detail}",
         }
 
     except RateLimitError as e:
-        msg = str(e)
+        error_detail = str(e)
         logger.error(
-            "[DALL·E] Rate limit exceeded | model=%s, error=%s",
-            models, msg
+            "[ERROR] API 사용량 초과 | model=%s | error=%s",
+            models, error_detail
         )
         return {
             "image_url": None,
             "refined_content": None,
-            "error_message": "Rate limit exceeded. Please try again later.",
+            "error_message": "API 사용량을 초과했습니다. 잠시 후 다시 시도해주세요.",
         }
 
     except APIConnectionError as e:
-        msg = str(e)
+        error_detail = str(e)
         logger.error(
-            "[DALL·E] API connection error | model=%s, error=%s",
-            models, msg
+            "[ERROR] API 연결 실패 | model=%s | error=%s",
+            models, error_detail
         )
         return {
             "image_url": None,
             "refined_content": None,
-            "error_message": "Failed to connect to OpenAI API. Please check your network.",
+            "error_message": "OpenAI API에 연결할 수 없습니다. 네트워크를 확인해주세요.",
         }
 
     except APIError as e:
-        msg = str(e)
+        error_detail = str(e)
         logger.error(
-            "[DALL·E] OpenAI API error | model=%s, error=%s",
-            models, msg
+            "[ERROR] OpenAI API 오류 | model=%s | error=%s",
+            models, error_detail
         )
         return {
             "image_url": None,
             "refined_content": None,
-            "error_message": f"OpenAI API error: {msg}",
+            "error_message": f"OpenAI API 오류: {error_detail}",
         }
 
-    # -----------------------------
-    # 8. 예상치 못한 모든 예외 처리
-    # -----------------------------
+    # =========================
+    # 9. 예상치 못한 모든 예외 처리
+    # =========================
     except Exception as e:
-        msg = str(e)
+        error_detail = str(e)
         logger.exception(
-            "[DALL·E] Unexpected error | model=%s, size=%s, quality=%s, style=%s, prompt=%s",
-            models, size, quality, style, prompt[:200]
+            "[ERROR] 예상치 못한 오류 | model=%s | size=%s | quality=%s | style=%s",
+            models, size, quality, style
         )
         return {
             "image_url": None,
             "refined_content": None,
-            "error_message": f"Unexpected error: {msg}",
+            "error_message": f"예상치 못한 오류가 발생했습니다: {error_detail}",
         }
