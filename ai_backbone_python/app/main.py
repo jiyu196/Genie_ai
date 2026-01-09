@@ -22,13 +22,13 @@ app = FastAPI(
 def health():
     return {"status": "ok"}
 
-# ✅ app 생성 이후에 include_router
+#  app 생성 이후에 include_router
 app.include_router(
     image_router,
     prefix="/api/v1",
     tags=["image"]
 )
 
-# 🔍 디버그용: 라우트 출력
+# 디버그용: 라우트 출력
 for r in app.routes:
     print(f"[ROUTE] {r.path} -> {r.name}")

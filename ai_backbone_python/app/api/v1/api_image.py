@@ -1,6 +1,7 @@
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 from typing import Optional
+from app.service.post_processor import post_process
 import logging
 
 from app.model.purifier import refine
@@ -108,17 +109,35 @@ def generate_image_api(req: ImageRequest):
             logger.info("[CHARACTER] 캐릭터 정보 없음 | access_id=%s", req.access_id)
 
         # =========================
-        # 3. 프롬프트 필터링 (욕설/비속어 제거)
+        # 3. 프롬프트 모델 순화
         # =========================
         if req.is_slang:
-            logger.info("[FILTER] 욕설 필터링 시작 | access_id=%s", req.access_id)
+            logger.info("[FILTER] 프롬프트 모델 순화 시작 | access_id=%s", req.access_id)
 
             try:
+
                 purified_prompt = refine(req.original_content)
+                # ✨ 후처리 로직 추가 ✨
+                logger.info(
+                    "[POST_PROCESS] 후처리 시작 | access_id=%s | before=%s...",
+                    req.access_id,
+                    purified_prompt[:50]
+                )
+
+                purified_prompt = post_process(
+                    original=req.original_content,
+                    purified=purified_prompt
+                )
+
+                logger.info(
+                    "[POST_PROCESS] 후처리 완료 | access_id=%s | after=%s...",
+                    req.access_id,
+                    purified_prompt[:50]
+                )
 
                 if not purified_prompt or not purified_prompt.strip():
                     logger.error(
-                        "[FILTER] 필터링 결과 빈 문자열 반환 | access_id=%s | original=%s...",
+                        "[FILTER] 모델 순화 결과 빈 문자열 반환 | access_id=%s | original=%s...",
                         req.access_id,
                         req.original_content[:50]
                     )
@@ -136,13 +155,13 @@ def generate_image_api(req: ImageRequest):
                 filtered_content = purified_prompt
                 final_prompt = purified_prompt
                 logger.info(
-                    "[FILTER] 필터링 완료 | access_id=%s | filtered=%s...",
+                    "[FILTER] 프롬프트 모델 순화 완료 | access_id=%s | filtered=%s...",
                     req.access_id,
                     filtered_content[:50]
                 )
             except Exception as filter_err:
                 logger.error(
-                    "[FILTER] 필터링 함수 예외 발생 | access_id=%s | error=%s",
+                    "[FILTER] 프롬프트 모델 순화 함수 예외 발생 | access_id=%s | error=%s",
                     req.access_id,
                     str(filter_err)
                 )
@@ -159,7 +178,7 @@ def generate_image_api(req: ImageRequest):
         else:
             filtered_content = req.original_content
             final_prompt = req.original_content
-            logger.info("[FILTER] 필터링 스킵 (is_slang=False) | access_id=%s", req.access_id)
+            logger.info("[FILTER] 프롬프트 모델 순화 스킵 (is_slang=False) | access_id=%s", req.access_id)
 
         # =========================
         # 4. 웹툰 스타일 프롬프트 생성

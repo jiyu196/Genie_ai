@@ -21,8 +21,8 @@ pyvenv.cfg
 # Environment variables
 ################################
 .env
-.env.*
-.env.local
+.env
+.env
 
 ################################
 # PyCharm / JetBrains
@@ -34,6 +34,7 @@ pyvenv.cfg
 # Model / Weights (중요)
 ################################
 app/model/kobart_purifier_stage2_v4/
+app/model/kobart_purifier_stage3_short/
 *.pt
 *.bin
 *.ckpt

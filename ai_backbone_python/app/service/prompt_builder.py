@@ -253,12 +253,12 @@ def log_prompt_construction(
     print(f"   {final_prompt}")
 
     # 통계
-    print("\n📊 [STATISTICS]")
-    print(f"   Original length: {len(original_prompt)} chars")
-    if character_description:
-        print(f"   Character length: {len(character_description)} chars")
-    print(f"   Final length: {len(final_prompt)} chars")
-    print(f"   Total tokens (approx): {len(final_prompt.split())} words")
+    # print("\n📊 [STATISTICS]")
+    # print(f"   Original length: {len(original_prompt)} chars")
+    # if character_description:
+    #     print(f"   Character length: {len(character_description)} chars")
+    # print(f"   Final length: {len(final_prompt)} chars")
+    # print(f"   Total tokens (approx): {len(final_prompt.split())} words")
 
     print(separator)
     print("🚀 Sending to DALL-E...")

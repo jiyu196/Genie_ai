@@ -9,12 +9,14 @@ from app.core.config import MODEL_DIR
 MODEL_NAME = os.getenv(
     "MODEL_NAME",
     "kobart_purifier_stage2_v4"
+#    "kobart_purifier_stage3_short"
 )
 
 # 체크포인트 선택
 MODEL_CHECKPOINT = os.getenv(
     "MODEL_CHECKPOINT",
     "checkpoint-5000"
+#    "checkpoint-2000"
 )
 
 MODEL_PATH = MODEL_DIR / MODEL_NAME / MODEL_CHECKPOINT
