@@ -2,5 +2,6 @@ uvicorn
 fastapi
 transformers
 openai
+aiohttp
 python-dotenv
 torch --index-url https://download.pytorch.org/whl/cu121

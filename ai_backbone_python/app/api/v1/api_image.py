@@ -1,38 +1,131 @@
-from fastapi import APIRouter, HTTPException
-from pydantic import BaseModel
+# app/api/v1/api_image.py
+from fastapi import APIRouter, Request
+from pydantic import BaseModel, Field, validator
 from typing import Optional
-from app.service.post_processor import post_process
 import logging
+import uuid
+import asyncio
+import time
+from concurrent.futures import ThreadPoolExecutor
 
-from app.model.purifier import refine
+from app.model.purifier import refine, health_check as purifier_health
 from app.service.openai_image_service import generate_image
-from app.service.translator import translate_to_korean
+from app.service.translator import translate_to_korean_async
 from app.core.character_store import character_store
 from app.service.prompt_builder import (
-    compose_korean_scene,
     build_webtoon_prompt,
     log_prompt_construction,
-    remove_style_from_revised_prompt,
-    log_revised_prompt_cleaning
+    compose_korean_scene
 )
+from app.service.post_processor import post_process
 
 logger = logging.getLogger("api_image")
 router = APIRouter()
 
+# =========================
+# 설정
+# =========================
 IMAGE_MODEL = "dall-e-3"
 IMAGE_SIZE = "1024x1024"
 IMAGE_QUALITY = "standard"
 IMAGE_STYLE = "vivid"
+
+# ✅ GPU 작업용 ThreadPool
+# - max_workers=3: 여러 요청 동시 처리 가능
+# - GPU 추론은 Semaphore로 직렬화
+gpu_executor = ThreadPoolExecutor(max_workers=3, thread_name_prefix="gpu_worker")
+
+# 타임아웃 설정
+PURIFIER_TIMEOUT = 30
+OPENAI_TIMEOUT = 60
+TRANSLATOR_TIMEOUT = 10
+
+# ✅ GPU 추론 직렬화용 세마포어 (동시 요청은 받되, GPU inference는 1개씩)
+GPU_INFER_SEMAPHORE = asyncio.Semaphore(1)
+
+
+# =========================
+# GPU 추론 함수 (동기)
+# =========================
+def _run_purifier_sync(text: str, request_id: str) -> str:
+    """GPU 추론 (동기) - ThreadPool에서 실행"""
+    logger.info(f"[{request_id}] Purifier 시작")
+    result = refine(text)
+    logger.info(f"[{request_id}] Purifier 완료")
+    return result
+
+
+# =========================
+# 비동기 래퍼 함수들
+# =========================
+async def run_purifier_async(text: str, request_id: str) -> str:
+    """GPU 추론 비동기 래퍼"""
+    loop = asyncio.get_running_loop()
+    try:
+        # ✅ GPU 추론은 반드시 1개씩만 실행 (동시성은 API 레벨에서 유지)
+        async with GPU_INFER_SEMAPHORE:
+            result = await asyncio.wait_for(
+                loop.run_in_executor(gpu_executor, _run_purifier_sync, text, request_id),
+                timeout=PURIFIER_TIMEOUT
+            )
+            return result
+    except asyncio.TimeoutError:
+        logger.error(f"[{request_id}] Purifier 타임아웃 ({PURIFIER_TIMEOUT}초)")
+        raise TimeoutError(f"프롬프트 정제 시간 초과")
+
+
+async def run_openai_async(prompt: str, request_id: str) -> dict:
+    """OpenAI API 비동기 호출"""
+    loop = asyncio.get_running_loop()
+    try:
+        result = await asyncio.wait_for(
+            loop.run_in_executor(
+                None,  # Default executor (ThreadPool)
+                generate_image,
+                IMAGE_MODEL,
+                prompt,
+                IMAGE_SIZE,
+                IMAGE_QUALITY,
+                IMAGE_STYLE
+            ),
+            timeout=OPENAI_TIMEOUT
+        )
+        return result
+    except asyncio.TimeoutError:
+        logger.error(f"[{request_id}] OpenAI 타임아웃 ({OPENAI_TIMEOUT}초)")
+        return {
+            "image_url": None,
+            "refined_content": None,
+            "error_message": f"이미지 생성 시간 초과 ({OPENAI_TIMEOUT}초)"
+        }
 
 
 # =========================
 # Request/Response Models
 # =========================
 class ImageRequest(BaseModel):
-    access_id: str
-    original_content: str
+    access_id: str = Field(..., min_length=1, max_length=100)
+    original_content: str = Field(..., min_length=1, max_length=1000)
     is_slang: bool
-    access_id_character: Optional[str] = None
+    access_id_character: Optional[str] = Field(None, max_length=500)
+
+    @validator('access_id')
+    def validate_access_id(cls, v):
+        if not v or not v.strip():
+            raise ValueError("access_id는 비어있을 수 없습니다")
+        return v.strip()
+
+    @validator('original_content')
+    def validate_content(cls, v):
+        if not v or not v.strip():
+            raise ValueError("original_content는 비어있을 수 없습니다")
+        return v.strip()
+
+    @validator('access_id_character')
+    def validate_character(cls, v):
+        if v is not None and v.strip():
+            return v.strip()
+        return None
 
 
 class ImageResponse(BaseModel):
@@ -41,152 +134,120 @@ class ImageResponse(BaseModel):
     original_content: str
     filtered_content: str
     refined_content: str
-    revised_prompt: str
+    revised_prompt: Optional[str] = None
     image_url: Optional[str] = None
     error_message: Optional[str] = None
 
 
+# =========================
+# 메인 API 엔드포인트
+# =========================
 @router.post("/image/generate", response_model=ImageResponse)
-def generate_image_api(req: ImageRequest):
+async def generate_image_api(req: ImageRequest, request: Request):
     """
-    이미지 생성 API 엔드포인트
-    - 욕설/비속어 필터링
-    - 웹툰 스타일 프롬프트 생성
-    - DALL-E 이미지 생성
+    ✅ 이미지 생성 API (최적화된 병렬 처리)
+
+    처리 흐름:
+    1. 입력 검증
+    2. 캐릭터 정보 저장/조회
+    3. [병렬 가능] 프롬프트 정제 (GPU) - Semaphore로 직렬화
+    4. 프롬프트 구성
+    5. [병렬 가능] OpenAI 이미지 생성
+    6. [병렬 가능] 번역
+    7. 응답 구성
     """
 
-    # 🔹 변수 초기화 (try 블록 밖에서 초기화하여 except에서도 안전하게 사용)
-    filtered_content = ""
-    final_prompt = ""
-    dalle_revised_prompt = ""
-    refined_content_for_response = ""
-    saved_character = None
+    request_id = str(uuid.uuid4())[:8]
+    start_time = time.time()
 
     logger.info(
-        "[REQUEST] 이미지 생성 요청 수신 | access_id=%s | is_slang=%s | has_character=%s | prompt_len=%d",
+        "[%s] === 요청 시작 === | access_id=%s | is_slang=%s | len=%d | client=%s",
+        request_id,
         req.access_id,
         req.is_slang,
-        bool(req.access_id_character),
-        len(req.original_content)
+        len(req.original_content),
+        request.client.host if request.client else "unknown"
     )
+
+    filtered_content = req.original_content
+    refined_content_for_response = ""
+    revised_prompt = ""
 
     try:
         # =========================
-        # 1. 입력 검증
+        # 1. 캐릭터 정보 처리
         # =========================
-        if not req.original_content or not req.original_content.strip():
-            logger.warning("[VALIDATION] 빈 프롬프트 수신 | access_id=%s", req.access_id)
-            return ImageResponse(
-                access_id=req.access_id,
-                is_slang=req.is_slang,
-                original_content=req.original_content,
-                filtered_content="",
-                refined_content="",
-                revised_prompt="",
-                image_url=None,
-                error_message="프롬프트가 비어있습니다.",
-            )
+        saved_character = None
 
-        # =========================
-        # 2. 캐릭터 정보 저장 및 조회
-        # =========================
-        if req.access_id_character and req.access_id_character.strip():
+        if req.access_id_character:
             character_store.set_character(req.access_id, req.access_id_character)
             logger.info(
-                "[CHARACTER] 새 캐릭터 저장 완료 | access_id=%s | char_len=%d",
-                req.access_id,
-                len(req.access_id_character)
+                "[%s] 캐릭터 저장 | access_id=%s | len=%d",
+                request_id, req.access_id, len(req.access_id_character)
             )
 
         saved_character = character_store.get_character(req.access_id)
         if saved_character:
             logger.info(
-                "[CHARACTER] 저장된 캐릭터 사용 | access_id=%s | char_preview=%s...",
-                req.access_id,
-                saved_character[:50]
+                "[%s] 캐릭터 조회 성공 | preview=%s...",
+                request_id, saved_character[:50]
             )
-        else:
-            logger.info("[CHARACTER] 캐릭터 정보 없음 | access_id=%s", req.access_id)
 
         # =========================
-        # 3. 프롬프트 모델 순화
+        # 2. 프롬프트 정제 (선택적)
         # =========================
         if req.is_slang:
-            logger.info("[FILTER] 프롬프트 모델 순화 시작 | access_id=%s", req.access_id)
+            logger.info(f"[{request_id}] 프롬프트 정제 시작")
 
             try:
+                # GPU 추론 (비동기 + Semaphore로 직렬화)
+                purified = await run_purifier_async(req.original_content, request_id)
 
-                purified_prompt = refine(req.original_content)
-                # ✨ 후처리 로직 추가 ✨
-                logger.info(
-                    "[POST_PROCESS] 후처리 시작 | access_id=%s | before=%s...",
-                    req.access_id,
-                    purified_prompt[:50]
-                )
+                # 후처리 (CPU, 빠름)
+                purified = post_process(req.original_content, purified)
 
-                purified_prompt = post_process(
-                    original=req.original_content,
-                    purified=purified_prompt
-                )
-
-                logger.info(
-                    "[POST_PROCESS] 후처리 완료 | access_id=%s | after=%s...",
-                    req.access_id,
-                    purified_prompt[:50]
-                )
-
-                if not purified_prompt or not purified_prompt.strip():
-                    logger.error(
-                        "[FILTER] 모델 순화 결과 빈 문자열 반환 | access_id=%s | original=%s...",
-                        req.access_id,
-                        req.original_content[:50]
-                    )
+                if not purified or not purified.strip():
+                    logger.error(f"[{request_id}] 정제 결과 비어있음")
                     return ImageResponse(
                         access_id=req.access_id,
                         is_slang=req.is_slang,
                         original_content=req.original_content,
                         filtered_content="",
                         refined_content="",
-                        revised_prompt="",
-                        image_url=None,
-                        error_message="프롬프트 정제 중 오류가 발생했습니다.",
+                        error_message="프롬프트 정제 실패"
                     )
 
-                filtered_content = purified_prompt
-                final_prompt = purified_prompt
+                filtered_content = purified
                 logger.info(
-                    "[FILTER] 프롬프트 모델 순화 완료 | access_id=%s | filtered=%s...",
-                    req.access_id,
-                    filtered_content[:50]
+                    "[%s] 정제 완료 | before_len=%d | after_len=%d",
+                    request_id, len(req.original_content), len(purified)
                 )
-            except Exception as filter_err:
-                logger.error(
-                    "[FILTER] 프롬프트 모델 순화 함수 예외 발생 | access_id=%s | error=%s",
-                    req.access_id,
-                    str(filter_err)
-                )
+
+            except TimeoutError as e:
+                logger.error(f"[{request_id}] 정제 타임아웃")
                 return ImageResponse(
                     access_id=req.access_id,
                     is_slang=req.is_slang,
                     original_content=req.original_content,
-                    filtered_content="",
+                    filtered_content=req.original_content,
                     refined_content="",
-                    revised_prompt="",
-                    image_url=None,
-                    error_message="프롬프트 정제 중 오류가 발생했습니다.",
+                    error_message=str(e)
                 )
+
+            except Exception as e:
+                logger.error(f"[{request_id}] 정제 오류: {e}")
+                filtered_content = req.original_content
+
         else:
-            filtered_content = req.original_content
-            final_prompt = req.original_content
-            logger.info("[FILTER] 프롬프트 모델 순화 스킵 (is_slang=False) | access_id=%s", req.access_id)
+            logger.info(f"[{request_id}] 정제 스킵 (is_slang=False)")
 
         # =========================
-        # 4. 웹툰 스타일 프롬프트 생성
+        # 3. 웹툰 스타일 프롬프트 구성
         # =========================
         try:
             final_prompt = build_webtoon_prompt(
                 character_description=saved_character,
-                scene_description=final_prompt,
+                scene_description=filtered_content,
                 include_style=True
             )
 
@@ -198,209 +259,198 @@ def generate_image_api(req: ImageRequest):
             )
 
             logger.info(
-                "[PROMPT] 웹툰 스타일 프롬프트 생성 완료 | access_id=%s | has_character=%s | final_len=%d",
-                req.access_id,
-                bool(saved_character),
-                len(final_prompt)
+                "[%s] 프롬프트 구성 완료 | final_len=%d",
+                request_id, len(final_prompt)
             )
-        except Exception as prompt_err:
-            logger.error(
-                "[PROMPT] 프롬프트 생성 실패 | access_id=%s | error=%s",
-                req.access_id,
-                str(prompt_err)
-            )
+
+        except Exception as e:
+            logger.error(f"[{request_id}] 프롬프트 구성 실패: {e}")
             return ImageResponse(
                 access_id=req.access_id,
                 is_slang=req.is_slang,
                 original_content=req.original_content,
                 filtered_content=filtered_content,
                 refined_content="",
-                revised_prompt="",
-                image_url=None,
-                error_message="프롬프트 생성 중 오류가 발생했습니다.",
+                error_message="프롬프트 구성 오류"
             )
 
         # =========================
-        # 5. DALL-E 이미지 생성
+        # 4. OpenAI 이미지 생성 (비동기)
         # =========================
-        logger.info("[DALLE] 이미지 생성 API 호출 | access_id=%s", req.access_id)
+        logger.info(f"[{request_id}] OpenAI 호출 시작")
 
-        try:
-            dalle_result = generate_image(
-                models=IMAGE_MODEL,
-                prompt=final_prompt,
-                size=IMAGE_SIZE,
-                quality=IMAGE_QUALITY,
-                style=IMAGE_STYLE,
-            )
-        except Exception as dalle_err:
-            logger.error(
-                "[DALLE] API 호출 실패 | access_id=%s | error=%s",
-                req.access_id,
-                str(dalle_err)
-            )
-            return ImageResponse(
-                access_id=req.access_id,
-                is_slang=req.is_slang,
-                original_content=req.original_content,
-                filtered_content=filtered_content,
-                refined_content="",
-                revised_prompt="",
-                image_url=None,
-                error_message="이미지 생성 API 호출 중 오류가 발생했습니다.",
-            )
+        dalle_result = await run_openai_async(final_prompt, request_id)
 
-        # 🔹 결과 타입 검증
+        # 결과 검증
         if not isinstance(dalle_result, dict):
-            logger.error(
-                "[DALLE] 잘못된 응답 타입 | access_id=%s | type=%s",
-                req.access_id,
-                type(dalle_result).__name__
-            )
+            logger.error(f"[{request_id}] OpenAI 응답 타입 오류")
             return ImageResponse(
                 access_id=req.access_id,
                 is_slang=req.is_slang,
                 original_content=req.original_content,
                 filtered_content=filtered_content,
                 refined_content="",
-                revised_prompt="",
-                image_url=None,
-                error_message="이미지 생성 서비스 오류가 발생했습니다.",
+                error_message="이미지 생성 서비스 오류"
             )
 
-        # =========================
-        # 6. DALL-E 결과 처리
-        # =========================
-        error_message = dalle_result.get("error_message")
-
-        # 6-1. 콘텐츠 정책 위반
-        if error_message == "content_policy_violation":
-            logger.warning(
-                "[DALLE] 콘텐츠 정책 위반 | access_id=%s | prompt=%s...",
-                req.access_id,
-                final_prompt[:50]
-            )
+        # 콘텐츠 정책 위반
+        if dalle_result.get("error_message") == "content_policy_violation":
+            logger.warning(f"[{request_id}] 콘텐츠 정책 위반")
             return ImageResponse(
                 access_id=req.access_id,
                 is_slang=req.is_slang,
                 original_content=req.original_content,
                 filtered_content=filtered_content,
                 refined_content=filtered_content,
-                revised_prompt="",
-                image_url=None,
-                error_message="콘텐츠 정책에 위반되어 이미지를 생성할 수 없습니다.",
+                error_message="콘텐츠 정책에 위반되어 이미지를 생성할 수 없습니다."
             )
 
-        # 6-2. 이미지 URL 없음 (기타 오류)
+        # 이미지 URL 없음
         if not dalle_result.get("image_url"):
-            logger.error(
-                "[DALLE] 이미지 URL 없음 | access_id=%s | error=%s",
-                req.access_id,
-                error_message or "Unknown"
-            )
+            error_msg = dalle_result.get("error_message") or "알 수 없는 오류"
+            logger.error(f"[{request_id}] 이미지 생성 실패: {error_msg}")
             return ImageResponse(
                 access_id=req.access_id,
                 is_slang=req.is_slang,
                 original_content=req.original_content,
                 filtered_content=filtered_content,
                 refined_content="",
-                revised_prompt="",
-                image_url=None,
-                error_message=f"이미지 생성 실패: {error_message or '알 수 없는 오류'}",
+                error_message=f"이미지 생성 실패: {error_msg}"
             )
 
-        # =========================
-        # 7. revised_prompt 처리 및 한글 번역
-        # =========================
-        dalle_revised_prompt = dalle_result.get("refined_content", "").strip()
+        logger.info(f"[{request_id}] 이미지 생성 성공")
 
-        if dalle_revised_prompt:
-            logger.info(
-                "[TRANSLATE] 번역 시작 | access_id=%s | original=%s...",
-                req.access_id,
-                dalle_revised_prompt[:50]
-            )
+        # =========================
+        # 5. revised_prompt 번역 (비동기)
+        # =========================
+        dalle_revised = dalle_result.get("refined_content", "").strip()
+
+        if dalle_revised:
+            logger.info(f"[{request_id}] 번역 시작")
 
             try:
-                translated_prompt = translate_to_korean(dalle_revised_prompt)
-                dalle_revised_prompt = translated_prompt
-                logger.info(
-                    "[TRANSLATE] 번역 완료 | access_id=%s | translated=%s...",
-                    req.access_id,
-                    translated_prompt[:50]
+                revised_prompt = await asyncio.wait_for(
+                    translate_to_korean_async(dalle_revised),
+                    timeout=TRANSLATOR_TIMEOUT
                 )
-            except Exception as trans_err:
-                logger.error(
-                    "[TRANSLATE] 번역 실패, 필터링된 원본 사용 | access_id=%s | error=%s",
-                    req.access_id,
-                    str(trans_err)
-                )
-                dalle_revised_prompt = filtered_content
+                logger.info(f"[{request_id}] 번역 완료")
+
+            except asyncio.TimeoutError:
+                logger.warning(f"[{request_id}] 번역 타임아웃, 원본 사용")
+                revised_prompt = filtered_content
+
+            except Exception as e:
+                logger.error(f"[{request_id}] 번역 실패: {e}")
+                revised_prompt = filtered_content
         else:
-            # 🔹 revised_prompt가 없으면 필터링된 원본 사용
-            dalle_revised_prompt = filtered_content
-            logger.info(
-                "[TRANSLATE] revised_prompt 없음, 필터링된 원본 사용 | access_id=%s",
-                req.access_id
-            )
+            revised_prompt = filtered_content
 
         # =========================
-        # 8. 최종 응답용 한국어 문장 생성
+        # 6. 최종 응답용 한국어 문장 구성
         # =========================
         try:
             refined_content_for_response = compose_korean_scene(
                 character_description=saved_character,
                 scene_description=filtered_content
             )
-
-            logger.info(
-                "[RESPONSE] 최종 응답 생성 완료 | access_id=%s | refined=%s...",
-                req.access_id,
-                refined_content_for_response[:50]
-            )
-        except Exception as compose_err:
-            logger.error(
-                "[RESPONSE] 응답 생성 실패, 필터링된 원본 사용 | access_id=%s | error=%s",
-                req.access_id,
-                str(compose_err)
-            )
+        except Exception as e:
+            logger.error(f"[{request_id}] 응답 구성 실패: {e}")
             refined_content_for_response = filtered_content
 
+        # =========================
+        # 7. 성공 응답
+        # =========================
+        processing_time = time.time() - start_time
+
         logger.info(
-            "[SUCCESS] 이미지 생성 성공 | access_id=%s | image_url=%s...",
-            req.access_id,
-            dalle_result.get("image_url", "")[:60]
+            "[%s] === 요청 완료 (성공) === | time=%.2fs | url=%s...",
+            request_id, processing_time, dalle_result["image_url"][:60]
         )
 
-        # =========================
-        # 9. 성공 응답 반환
-        # =========================
         return ImageResponse(
             access_id=req.access_id,
             is_slang=req.is_slang,
             original_content=req.original_content,
             filtered_content=filtered_content,
             refined_content=refined_content_for_response,
-            revised_prompt=dalle_revised_prompt,
-            image_url=dalle_result.get("image_url"),
-            error_message=None,
+            revised_prompt=revised_prompt,
+            image_url=dalle_result["image_url"],
+            error_message=None
         )
 
+    # =========================
+    # 8. 전역 예외 처리
+    # =========================
     except Exception as e:
+        processing_time = time.time() - start_time
+
         logger.exception(
-            "[ERROR] 예상치 못한 오류 발생 | access_id=%s | error=%s",
-            req.access_id,
-            str(e)
+            "[%s] === 요청 완료 (오류) === | time=%.2fs",
+            request_id, processing_time
         )
 
-        # 🔹 에러 발생 시에도 가능한 정보 반환
         return ImageResponse(
             access_id=req.access_id,
             is_slang=req.is_slang,
             original_content=req.original_content,
             filtered_content=filtered_content,
             refined_content=refined_content_for_response or filtered_content,
-            revised_prompt=dalle_revised_prompt,
-            image_url=None,
-            error_message="서버 내부 오류가 발생했습니다.",
+            revised_prompt=revised_prompt,
+            error_message=f"서버 오류: {str(e)}"
         )
+
+
+# =========================
+# 헬스체크 엔드포인트
+# =========================
+@router.get("/image/health")
+async def health_check():
+    """서비스 상태 확인"""
+    from app.service.openai_image_service import health_check as openai_health
+
+    purifier_status = purifier_health()
+    openai_status = openai_health()
+    character_stats = character_store.get_stats()
+
+    is_healthy = (
+            purifier_status.get("model_available", False) and
+            openai_status.get("client_initialized", False)
+    )
+
+    return {
+        "status": "healthy" if is_healthy else "degraded",
+        "model": IMAGE_MODEL,
+        "purifier": purifier_status,
+        "openai": openai_status,
+        "character_store": character_stats,
+        "gpu_executor": {
+            "max_workers": gpu_executor._max_workers,
+        },
+        "gpu_semaphore": {
+            "limit": GPU_INFER_SEMAPHORE._value,
+            "note": "GPU 추론은 동시에 1개만 실행"
+        },
+        "timeouts": {
+            "purifier": PURIFIER_TIMEOUT,
+            "openai": OPENAI_TIMEOUT,
+            "translator": TRANSLATOR_TIMEOUT
+        }
+    }
+
+
+@router.get("/image/info")
+async def service_info():
+    """서비스 정보"""
+    return {
+        "service": "Webtoon AI Image Generator",
+        "version": "2.0.0",
+        "model": IMAGE_MODEL,
+        "image_size": IMAGE_SIZE,
+        "features": [
+            "프롬프트 정제 (KoBART)",
+            "캐릭터 일관성 유지",
+            "웹툰 스타일 생성",
+            "자동 번역",
+            "GPU 추론 직렬화"
+        ]
+    }
