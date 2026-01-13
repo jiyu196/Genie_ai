@@ -3,6 +3,7 @@ from fastapi import APIRouter, Request
 from pydantic import BaseModel, Field, validator
 from typing import Optional
 import logging
+
 import uuid
 import asyncio
 import time
@@ -12,6 +13,7 @@ from app.model.purifier import refine, health_check as purifier_health
 from app.service.openai_image_service import generate_image
 from app.service.translator import translate_to_korean_async
 from app.core.character_store import character_store
+from app.service.request_trace import trace
 from app.service.prompt_builder import (
     build_webtoon_prompt,
     log_prompt_construction,
@@ -64,6 +66,7 @@ async def run_purifier_async(text: str, request_id: str) -> str:
     try:
         # ✅ GPU 추론은 반드시 1개씩만 실행 (동시성은 API 레벨에서 유지)
         async with GPU_INFER_SEMAPHORE:
+            trace("BEFORE MODEL RUN", request_id)
             result = await asyncio.wait_for(
                 loop.run_in_executor(gpu_executor, _run_purifier_sync, text, request_id),
                 timeout=PURIFIER_TIMEOUT
@@ -97,6 +100,13 @@ async def run_openai_async(prompt: str, request_id: str) -> dict:
             "image_url": None,
             "refined_content": None,
             "error_message": f"이미지 생성 시간 초과 ({OPENAI_TIMEOUT}초)"
+        }
+    except Exception as e:
+        logger.exception("[%s] OpenAI 호출 예외", request_id)
+        return {
+            "image_url": None,
+            "refined_content": None,
+            "error_message": f"이미지 생성 서비스 오류: {str(e)}",
         }
 
 
@@ -156,8 +166,11 @@ async def generate_image_api(req: ImageRequest, request: Request):
     6. [병렬 가능] 번역
     7. 응답 구성
     """
-
+    # 🔴 요청 단위 추적 ID
     request_id = str(uuid.uuid4())[:8]
+    # 🔹 1. 요청이 FastAPI에 도착한 순간
+    trace("REQUEST RECEIVED", request_id)
+
     start_time = time.time()
 
     logger.info(
@@ -181,10 +194,13 @@ async def generate_image_api(req: ImageRequest, request: Request):
 
         if req.access_id_character:
             character_store.set_character(req.access_id, req.access_id_character)
+            trace(f"CHARACTER SAVE user={req.access_id}", request_id)
             logger.info(
                 "[%s] 캐릭터 저장 | access_id=%s | len=%d",
                 request_id, req.access_id, len(req.access_id_character)
             )
+        else:
+            trace(f"CHARACTER LOAD user={req.access_id}", request_id)
 
         saved_character = character_store.get_character(req.access_id)
         if saved_character:

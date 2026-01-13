@@ -11,13 +11,23 @@ logger = logging.getLogger("prompt_builder")
 
 # 우리가 보내는 스타일 키워드 (정확히 이것만 제거)
 STYLE_KEYWORDS_TO_REMOVE = [
-    "webtoon style illustration",
-    "clean lines",
-    "vibrant colors",
-    "professional digital illustration",
-    "studio quality",
-    "manhwa art style",
-    "digital art"
+    # "webtoon style illustration",
+    # "clean lines",
+    # "vibrant colors",
+    # "professional digital illustration",
+    # "studio quality",
+    # "manhwa art style",
+    # "digital art"
+    "Korean webtoon panel style",
+    "soft pastel color palette",
+    "natural shading",
+    "expressive character faces",
+    "subtle line art",
+    "clean but not vectorized",
+    "dramatic lighting",
+    "cinematic framing",
+    "emotional atmosphere",
+    "slice-of-life manhwa style"
 ]
 
 def ko_to_ko_translate(text: str) -> str:
