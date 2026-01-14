@@ -11,23 +11,50 @@ logger = logging.getLogger("prompt_builder")
 
 # 우리가 보내는 스타일 키워드 (정확히 이것만 제거)
 STYLE_KEYWORDS_TO_REMOVE = [
-    # "webtoon style illustration",
+    "manhwa-inspired composition",
+    # "Korean webtoon style illustration",
+    "clean lines",
+    "vibrant colors",
+    "professional digital illustration",
+    "studio quality",
+    "manhwa art style",
+    "digital art"
+    # "Korean webtoon panel style",
+    "vertical scroll comic style",
+     "soft pastel color palette",
+
+    # "natural shading",
+    # "expressive character faces",
+    # "subtle line art",
+    # "clean but not vectorized",
+    # "dramatic lighting",
+    # "cinematic framing",
+    # "emotional atmosphere",
+    # "slice-of-life manhwa style"
+    # "modern webtoon panel style",
+    # "soft pastel color palette",
+    # "natural cel shading",
+    # "expressive character faces with detailed eyes",
+    # "clean line art with subtle variation",
+    # "digital illustration style",
+    # "dramatic lighting and depth",
+    # "cinematic vertical framing",
+    # "emotional atmosphere",
+    # "contemporary romance comic aesthetic",
+    # "manhwa-inspired composition"
+
+    # "vertical scroll comic style",
+    # "soft pastel colors with gradient shading",
     # "clean lines",
     # "vibrant colors",
-    # "professional digital illustration",
-    # "studio quality",
-    # "manhwa art style",
-    # "digital art"
-    "Korean webtoon panel style",
-    "soft pastel color palette",
-    "natural shading",
-    "expressive character faces",
-    "subtle line art",
-    "clean but not vectorized",
-    "dramatic lighting",
-    "cinematic framing",
-    "emotional atmosphere",
-    "slice-of-life manhwa style"
+    # "natural cel shading",
+    # "expressive faces with detailed emotional eyes",
+    # "clean digital line art",
+    # "cinematic panel composition",
+    # "dramatic mood lighting",
+    # "romance illustration aesthetic",
+    # "emotional atmosphere",
+    # "cel-shaded rendering"
 ]
 
 def ko_to_ko_translate(text: str) -> str:

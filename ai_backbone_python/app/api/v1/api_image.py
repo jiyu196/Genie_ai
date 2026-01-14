@@ -20,6 +20,7 @@ from app.service.prompt_builder import (
     compose_korean_scene
 )
 from app.service.post_processor import post_process
+from app.core.rule_filter import apply_rule_filter, health_check as rule_filter_health
 
 logger = logging.getLogger("api_image")
 router = APIRouter()
@@ -159,12 +160,13 @@ async def generate_image_api(req: ImageRequest, request: Request):
 
     처리 흐름:
     1. 입력 검증
-    2. 캐릭터 정보 저장/조회
-    3. [병렬 가능] 프롬프트 정제 (GPU) - Semaphore로 직렬화
-    4. 프롬프트 구성
-    5. [병렬 가능] OpenAI 이미지 생성
-    6. [병렬 가능] 번역
-    7. 응답 구성
+    2. RuleFilter 적용 (original_content, access_id_character)
+    3. 캐릭터 정보 저장/조회
+    4. [병렬 가능] 프롬프트 정제 (GPU) - Semaphore로 직렬화
+    5. 프롬프트 구성
+    6. [병렬 가능] OpenAI 이미지 생성
+    7. [병렬 가능] 번역
+    8. 응답 구성
     """
     # 🔴 요청 단위 추적 ID
     request_id = str(uuid.uuid4())[:8]
@@ -181,11 +183,26 @@ async def generate_image_api(req: ImageRequest, request: Request):
         len(req.original_content),
         request.client.host if request.client else "unknown"
     )
+    # ✅✅✅ RuleFilter 적용 (요청 즉시) ✅✅✅
+    rule_filtered_content = apply_rule_filter(req.original_content)
+    req.original_content = rule_filtered_content
+    rule_filtered_character = None
 
-    filtered_content = req.original_content
+    if req.access_id_character:
+        rule_filtered_character = apply_rule_filter(req.access_id_character)
+        req.access_id_character = rule_filtered_character
+    logger.info(
+        "[%s] 🔍 RuleFilter 적용 | content: %d→%d chars | character: %s",
+        request_id,
+        len(req.original_content),
+        len(rule_filtered_content),
+        f"{len(req.access_id_character)}→{len(rule_filtered_character)} chars"
+        if rule_filtered_character else "N/A"
+    )
+
+    filtered_content = rule_filtered_content
     refined_content_for_response = ""
     revised_prompt = ""
-
     try:
         # =========================
         # 1. 캐릭터 정보 처리
